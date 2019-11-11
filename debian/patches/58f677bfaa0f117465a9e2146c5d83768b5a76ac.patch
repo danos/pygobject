@@ -1,0 +1,363 @@
+From 58f677bfaa0f117465a9e2146c5d83768b5a76ac Mon Sep 17 00:00:00 2001
+From: Christoph Reiter <creiter@src.gnome.org>
+Date: Fri, 24 Nov 2017 13:11:26 +0100
+Subject: [PATCH] Install a default SIGINT handler for functions which start an
+ event loop
+
+Currently ctrl+c on a program blocked on Gtk.main() will raise an exception
+but not return control. While it's easy to set up the proper signal handling and
+stop the event loop or execute some other application shutdown code
+it's nice to have a good default behaviour for small prototypes/examples
+or when testing some code in an interactive console.
+
+This adds a context manager which registers a SIGINT handler only in case
+the default Python signal handler is active and restores the original handle
+afterwards. Since signal handlers registered through g_unix_signal_add()
+are not detected by Python's signal module we use PyOS_getsig() through ctypes
+to detect if the signal handler is changed from outside.
+
+In case of nested event loops, all of them will be aborted.
+In case an event loop is started in a thread, nothing will happen.
+
+The context manager is used in the overrides for Gtk.main(), Gtk.Dialog.run(),
+Gio.Application.run() and GLib.MainLoop.run()
+
+This also fixes GLib.MainLoop.run() replacing a non-default signal handler
+and not restoring the default one:
+    https://bugzilla.gnome.org/show_bug.cgi?id=698623
+
+https://bugzilla.gnome.org/show_bug.cgi?id=622084
+---
+ gi/_ossighelper.py   | 115 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ gi/overrides/GLib.py |  31 +++-----------
+ gi/overrides/Gio.py  |   7 ++--
+ gi/overrides/Gtk.py  |  12 +++---
+ tests/test_ossig.py  |  73 +++++++++++++++++++++++++++++++-
+ 5 files changed, 203 insertions(+), 35 deletions(-)
+
+--- a/gi/_ossighelper.py
++++ b/gi/_ossighelper.py
+@@ -20,6 +20,8 @@
+ import sys
+ import socket
+ import signal
++import ctypes
++import threading
+ from contextlib import closing, contextmanager
+ 
+ 
+@@ -135,3 +137,116 @@
+                 # so let's re-revert again.
+                 signal.set_wakeup_fd(write_fd)
+             _wakeup_fd_is_active = False
++
++
++pydll = ctypes.PyDLL(None)
++PyOS_getsig = pydll.PyOS_getsig
++PyOS_getsig.restype = ctypes.c_void_p
++PyOS_getsig.argtypes = [ctypes.c_int]
++
++# We save the signal pointer so we can detect if glib has changed the
++# signal handler behind Python's back (GLib.unix_signal_add)
++if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
++    startup_sigint_ptr = PyOS_getsig(signal.SIGINT)
++else:
++    # Something has set the handler before import, we can't get a ptr
++    # for the default handler so make sure the pointer will never match.
++    startup_sigint_ptr = -1
++
++
++def sigint_handler_is_default():
++    """Returns if on SIGINT the default Python handler would be called"""
++
++    return (signal.getsignal(signal.SIGINT) is signal.default_int_handler and
++            PyOS_getsig(signal.SIGINT) == startup_sigint_ptr)
++
++
++@contextmanager
++def sigint_handler_set_and_restore_default(handler):
++    """Context manager for saving/restoring the SIGINT handler default state.
++
++    Will only restore the default handler again if the handler is not changed
++    while the context is active.
++    """
++
++    assert sigint_handler_is_default()
++
++    signal.signal(signal.SIGINT, handler)
++    sig_ptr = PyOS_getsig(signal.SIGINT)
++    try:
++        yield
++    finally:
++        if signal.getsignal(signal.SIGINT) is handler and \
++                PyOS_getsig(signal.SIGINT) == sig_ptr:
++            signal.signal(signal.SIGINT, signal.default_int_handler)
++
++
++def is_main_thread():
++    """Returns True in case the function is called from the main thread"""
++
++    return threading.current_thread().name == "MainThread"
++
++
++_callback_stack = []
++_sigint_called = False
++
++
++@contextmanager
++def register_sigint_fallback(callback):
++    """Installs a SIGINT signal handler in case the default Python one is
++    active which calls 'callback' in case the signal occurs.
++
++    Only does something if called from the main thread.
++
++    In case of nested context managers the signal handler will be only
++    installed once and the callbacks will be called in the reverse order
++    of their registration.
++
++    The old signal handler will be restored in case no signal handler is
++    registered while the context is active.
++    """
++
++    # To handle multiple levels of event loops we need to call the last
++    # callback first, wait until the inner most event loop returns control
++    # and only then call the next callback, and so on... until we
++    # reach the outer most which manages the signal handler and raises
++    # in the end
++
++    global _callback_stack, _sigint_called
++
++    if not is_main_thread():
++        yield
++        return
++
++    if not sigint_handler_is_default():
++        if _callback_stack:
++            # This is an inner event loop, append our callback
++            # to the stack so the parent context can call it.
++            _callback_stack.append(callback)
++            try:
++                yield
++            finally:
++                if _sigint_called:
++                    _callback_stack.pop()()
++        else:
++            # There is a signal handler set by the user, just do nothing
++            yield
++        return
++
++    _sigint_called = False
++
++    def sigint_handler(sig_num, frame):
++        global _callback_stack, _sigint_called
++
++        if _sigint_called:
++            return
++        _sigint_called = True
++        _callback_stack.pop()()
++
++    _callback_stack.append(callback)
++    with sigint_handler_set_and_restore_default(sigint_handler):
++        try:
++            yield
++        finally:
++            if _sigint_called:
++                signal.default_int_handler()
+--- a/gi/overrides/GLib.py
++++ b/gi/overrides/GLib.py
+@@ -19,12 +19,11 @@
+ # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+ # USA
+ 
+-import signal
+ import warnings
+ import sys
+ import socket
+ 
+-from .._ossighelper import wakeup_on_signal
++from .._ossighelper import wakeup_on_signal, register_sigint_fallback
+ from ..module import get_introspection_module
+ from .._gi import (variant_type_from_string, source_new,
+                    source_set_callback, io_channel_read)
+@@ -550,33 +549,13 @@
+     def __new__(cls, context=None):
+         return GLib.MainLoop.new(context, False)
+ 
+-    # Retain classic pygobject behaviour of quitting main loops on SIGINT
+     def __init__(self, context=None):
+-        def _handler(loop):
+-            loop.quit()
+-            loop._quit_by_sigint = True
+-            # We handle signal deletion in __del__, return True so GLib
+-            # doesn't do the deletion for us.
+-            return True
+-
+-        if sys.platform != 'win32':
+-            # compatibility shim, keep around until we depend on glib 2.36
+-            if hasattr(GLib, 'unix_signal_add'):
+-                fn = GLib.unix_signal_add
+-            else:
+-                fn = GLib.unix_signal_add_full
+-            self._signal_source = fn(GLib.PRIORITY_DEFAULT, signal.SIGINT, _handler, self)
+-
+-    def __del__(self):
+-        if hasattr(self, '_signal_source'):
+-            GLib.source_remove(self._signal_source)
++        pass
+ 
+     def run(self):
+-        with wakeup_on_signal():
+-            super(MainLoop, self).run()
+-        if hasattr(self, '_quit_by_sigint'):
+-            # caught by _main_loop_sigint_handler()
+-            raise KeyboardInterrupt
++        with register_sigint_fallback(self.quit):
++            with wakeup_on_signal():
++                super(MainLoop, self).run()
+ 
+ MainLoop = override(MainLoop)
+ __all__.append('MainLoop')
+--- a/gi/overrides/Gio.py
++++ b/gi/overrides/Gio.py
+@@ -18,7 +18,7 @@
+ # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+ # USA
+ 
+-from .._ossighelper import wakeup_on_signal
++from .._ossighelper import wakeup_on_signal, register_sigint_fallback
+ from ..overrides import override, deprecated_init
+ from ..module import get_introspection_module
+ 
+@@ -33,8 +33,9 @@
+ class Application(Gio.Application):
+ 
+     def run(self, *args, **kwargs):
+-        with wakeup_on_signal():
+-            return Gio.Application.run(self, *args, **kwargs)
++        with register_sigint_fallback(self.quit):
++            with wakeup_on_signal():
++                return Gio.Application.run(self, *args, **kwargs)
+ 
+ 
+ Application = override(Application)
+--- a/gi/overrides/Gtk.py
++++ b/gi/overrides/Gtk.py
+@@ -24,7 +24,7 @@
+ import warnings
+ 
+ from gi.repository import GObject
+-from .._ossighelper import wakeup_on_signal
++from .._ossighelper import wakeup_on_signal, register_sigint_fallback
+ from ..overrides import override, strip_boolean_result, deprecated_init
+ from ..module import get_introspection_module
+ from gi import PyGIDeprecationWarning
+@@ -541,8 +541,9 @@
+             self.add_buttons(*add_buttons)
+ 
+     def run(self, *args, **kwargs):
+-        with wakeup_on_signal():
+-            return Gtk.Dialog.run(self, *args, **kwargs)
++        with register_sigint_fallback(self.destroy):
++            with wakeup_on_signal():
++                return Gtk.Dialog.run(self, *args, **kwargs)
+ 
+     action_area = property(lambda dialog: dialog.get_action_area())
+     vbox = property(lambda dialog: dialog.get_content_area())
+@@ -1569,8 +1570,9 @@
+ 
+ @override(Gtk.main)
+ def main(*args, **kwargs):
+-    with wakeup_on_signal():
+-        return _Gtk_main(*args, **kwargs)
++    with register_sigint_fallback(Gtk.main_quit):
++        with wakeup_on_signal():
++            return _Gtk_main(*args, **kwargs)
+ 
+ 
+ stock_lookup = strip_boolean_result(Gtk.stock_lookup)
+--- a/tests/test_ossig.py
++++ b/tests/test_ossig.py
+@@ -21,7 +21,7 @@
+ from contextlib import contextmanager
+ 
+ from gi.repository import Gtk, Gio, GLib
+-from gi._ossighelper import wakeup_on_signal
++from gi._ossighelper import wakeup_on_signal, register_sigint_fallback
+ 
+ 
+ class TestOverridesWakeupOnAlarm(unittest.TestCase):
+@@ -100,3 +100,74 @@
+ 
+         with self._run_with_timeout(2000, d.destroy):
+             d.run()
++
++
++class TestSigintFallback(unittest.TestCase):
++
++    def setUp(self):
++        self.assertEqual(
++            signal.getsignal(signal.SIGINT), signal.default_int_handler)
++
++    def tearDown(self):
++        self.assertEqual(
++            signal.getsignal(signal.SIGINT), signal.default_int_handler)
++
++    def test_replace_handler_and_restore_nested(self):
++        with register_sigint_fallback(lambda: None):
++            new_handler = signal.getsignal(signal.SIGINT)
++            self.assertNotEqual(new_handler, signal.default_int_handler)
++            with register_sigint_fallback(lambda: None):
++                self.assertTrue(signal.getsignal(signal.SIGINT) is new_handler)
++        self.assertEqual(
++            signal.getsignal(signal.SIGINT), signal.default_int_handler)
++
++    def test_no_replace_if_not_default(self):
++        new_handler = lambda *args: None
++        signal.signal(signal.SIGINT, new_handler)
++        try:
++            with register_sigint_fallback(lambda: None):
++                self.assertTrue(signal.getsignal(signal.SIGINT) is new_handler)
++                with register_sigint_fallback(lambda: None):
++                    self.assertTrue(
++                        signal.getsignal(signal.SIGINT) is new_handler)
++            self.assertTrue(signal.getsignal(signal.SIGINT) is new_handler)
++        finally:
++            signal.signal(signal.SIGINT, signal.default_int_handler)
++
++    def test_noop_in_threads(self):
++        failed = []
++
++        def target():
++            try:
++                with register_sigint_fallback(lambda: None):
++                    with register_sigint_fallback(lambda: None):
++                        self.assertTrue(
++                            signal.getsignal(signal.SIGINT) is
++                            signal.default_int_handler)
++            except:
++                failed.append(1)
++
++        t = threading.Thread(target=target)
++        t.start()
++        t.join(5)
++        self.assertFalse(failed)
++
++    @unittest.skipIf(os.name == "nt", "not on Windows")
++    def test_no_replace_if_set_by_glib(self):
++        id_ = GLib.unix_signal_add(
++            GLib.PRIORITY_DEFAULT, signal.SIGINT, lambda *args: None)
++        try:
++            # signal.getsignal() doesn't pick up that unix_signal_add()
++            # has changed the handler, but we should anyway.
++            self.assertEqual(
++                signal.getsignal(signal.SIGINT), signal.default_int_handler)
++            with register_sigint_fallback(lambda: None):
++                self.assertEqual(
++                    signal.getsignal(signal.SIGINT),
++                    signal.default_int_handler)
++            self.assertEqual(
++                signal.getsignal(signal.SIGINT), signal.default_int_handler)
++        finally:
++            GLib.source_remove(id_)
++            signal.signal(signal.SIGINT, signal.SIG_DFL)
++            signal.signal(signal.SIGINT, signal.default_int_handler)

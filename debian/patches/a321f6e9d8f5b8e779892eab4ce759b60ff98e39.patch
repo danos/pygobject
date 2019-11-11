@@ -1,0 +1,391 @@
+From a321f6e9d8f5b8e779892eab4ce759b60ff98e39 Mon Sep 17 00:00:00 2001
+From: Christoph Reiter <creiter@src.gnome.org>
+Date: Fri, 17 Nov 2017 20:05:24 +0100
+Subject: [PATCH] Make Python OS signal handlers run when an event loop is
+ idling
+
+When Python receives a signal such as SIGINT it sets a flag and will execute
+the registered signal handler on the next call to PyErr_CheckSignals().
+In case the main thread is blocked by an idling event loop (say Gtk.main()
+or Gtk.Dialog.run()) the check never happens and the signal handler
+will not get executed.
+
+To work around the issue use signal.set_wakeup_fd() to wake up the active
+event loop when a signal is received, which will invoke a Python callback
+which will lead to the signal handler being executed.
+
+This patch enables it in overrides for Gtk.main(), Gtk.Dialog.run(),
+Gio.Application.run() and GLib.MainLoop.run().
+
+Works on Unix, and on Windows with Python 3.5+.
+
+With this fix in place it is possible to have a cross platform way to
+react to SIGINT (GLib.unix_signal_add() worked, but not on Windows),
+for example:
+
+    signal.signal(signal.SIGINT, lambda *args: Gtk.main_quit())
+    Gtk.main()
+
+https://bugzilla.gnome.org/show_bug.cgi?id=622084
+---
+ Makefile.am          |   3 +-
+ gi/_ossighelper.py   | 137 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ gi/overrides/GLib.py |   4 +-
+ gi/overrides/Gio.py  |  12 +++++
+ gi/overrides/Gtk.py  |  14 ++++++
+ tests/Makefile.am    |   1 +
+ tests/test_ossig.py  | 102 ++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 271 insertions(+), 2 deletions(-)
+ create mode 100644 gi/_ossighelper.py
+ create mode 100644 tests/test_ossig.py
+
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -67,7 +67,8 @@
+ 	gi/_propertyhelper.py \
+ 	gi/_signalhelper.py \
+ 	gi/_option.py \
+-	gi/_error.py
++	gi/_error.py \
++	gi/_ossighelper.py
+ 
+ # if we build in a separate tree, we need to symlink the *.py files from the
+ # source tree; Python does not accept the extensions and modules in different
+--- /dev/null
++++ b/gi/_ossighelper.py
+@@ -0,0 +1,137 @@
++# -*- coding: utf-8 -*-
++# Copyright 2017 Christoph Reiter
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2.1 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, see <http://www.gnu.org/licenses/>.
++
++from __future__ import print_function
++
++import os
++import sys
++import socket
++import signal
++from contextlib import closing, contextmanager
++
++
++def ensure_socket_not_inheritable(sock):
++    """Ensures that the socket is not inherited by child processes
++
++    Raises:
++        EnvironmentError
++        NotImplementedError: With Python <3.4 on Windows
++    """
++
++    if hasattr(sock, "set_inheritable"):
++        sock.set_inheritable(False)
++    else:
++        try:
++            import fcntl
++        except ImportError:
++            raise NotImplementedError(
++                "Not implemented for older Python on Windows")
++        else:
++            fd = sock.fileno()
++            flags = fcntl.fcntl(fd, fcntl.F_GETFD)
++            fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
++
++
++_wakeup_fd_is_active = False
++"""Since we can't check if set_wakeup_fd() is already used for nested event
++loops without introducing a race condition we keep track of it globally.
++"""
++
++
++@contextmanager
++def wakeup_on_signal():
++    """A decorator for functions which create a glib event loop to keep
++    Python signal handlers working while the event loop is idling.
++
++    In case an OS signal is received will wake the default event loop up
++    shortly so that any registered Python signal handlers registered through
++    signal.signal() can run.
++
++    Works on Windows but needs Python 3.5+.
++
++    In case the wrapped function is not called from the main thread it will be
++    called as is and it will not wake up the default loop for signals.
++    """
++
++    global _wakeup_fd_is_active
++
++    if _wakeup_fd_is_active:
++        yield
++        return
++
++    from gi.repository import GLib
++
++    # On Windows only Python 3.5+ supports passing sockets to set_wakeup_fd
++    set_wakeup_fd_supports_socket = (
++        os.name != "nt" or sys.version_info[:2] >= (3, 5))
++    # On Windows only Python 3 has an implementation of socketpair()
++    has_socketpair = hasattr(socket, "socketpair")
++
++    if not has_socketpair or not set_wakeup_fd_supports_socket:
++        yield
++        return
++
++    read_socket, write_socket = socket.socketpair()
++    with closing(read_socket), closing(write_socket):
++
++        for sock in [read_socket, write_socket]:
++            sock.setblocking(False)
++            ensure_socket_not_inheritable(sock)
++
++        try:
++            orig_fd = signal.set_wakeup_fd(write_socket.fileno())
++        except ValueError:
++            # Raised in case this is not the main thread -> give up.
++            yield
++            return
++        else:
++            _wakeup_fd_is_active = True
++
++        def signal_notify(source, condition):
++            if condition & GLib.IO_IN:
++                try:
++                    return bool(read_socket.recv(1))
++                except EnvironmentError as e:
++                    print(e)
++                    return False
++                return True
++            else:
++                return False
++
++        try:
++            if os.name == "nt":
++                channel = GLib.IOChannel.win32_new_socket(
++                    read_socket.fileno())
++            else:
++                channel = GLib.IOChannel.unix_new(read_socket.fileno())
++
++            source_id = GLib.io_add_watch(
++                channel,
++                GLib.PRIORITY_DEFAULT,
++                (GLib.IOCondition.IN | GLib.IOCondition.HUP |
++                 GLib.IOCondition.NVAL | GLib.IOCondition.ERR),
++                signal_notify)
++            try:
++                yield
++            finally:
++                GLib.source_remove(source_id)
++        finally:
++            write_fd = signal.set_wakeup_fd(orig_fd)
++            if write_fd != write_socket.fileno():
++                # Someone has called set_wakeup_fd while func() was active,
++                # so let's re-revert again.
++                signal.set_wakeup_fd(write_fd)
++            _wakeup_fd_is_active = False
+--- a/gi/overrides/GLib.py
++++ b/gi/overrides/GLib.py
+@@ -24,6 +24,7 @@
+ import sys
+ import socket
+ 
++from .._ossighelper import wakeup_on_signal
+ from ..module import get_introspection_module
+ from .._gi import (variant_type_from_string, source_new,
+                    source_set_callback, io_channel_read)
+@@ -571,7 +572,8 @@
+             GLib.source_remove(self._signal_source)
+ 
+     def run(self):
+-        super(MainLoop, self).run()
++        with wakeup_on_signal():
++            super(MainLoop, self).run()
+         if hasattr(self, '_quit_by_sigint'):
+             # caught by _main_loop_sigint_handler()
+             raise KeyboardInterrupt
+--- a/gi/overrides/Gio.py
++++ b/gi/overrides/Gio.py
+@@ -18,6 +18,7 @@
+ # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+ # USA
+ 
++from .._ossighelper import wakeup_on_signal
+ from ..overrides import override, deprecated_init
+ from ..module import get_introspection_module
+ 
+@@ -29,6 +30,15 @@
+ 
+ __all__ = []
+ 
++class Application(Gio.Application):
++
++    def run(self, *args, **kwargs):
++        with wakeup_on_signal():
++            return Gio.Application.run(self, *args, **kwargs)
++
++
++Application = override(Application)
++__all__.append('Application')
+ 
+ class FileEnumerator(Gio.FileEnumerator):
+     def __iter__(self):
+--- a/gi/overrides/Gtk.py
++++ b/gi/overrides/Gtk.py
+@@ -24,6 +24,7 @@
+ import warnings
+ 
+ from gi.repository import GObject
++from .._ossighelper import wakeup_on_signal
+ from ..overrides import override, strip_boolean_result, deprecated_init
+ from ..module import get_introspection_module
+ from gi import PyGIDeprecationWarning
+@@ -539,6 +540,10 @@
+         if add_buttons:
+             self.add_buttons(*add_buttons)
+ 
++    def run(self, *args, **kwargs):
++        with wakeup_on_signal():
++            return Gtk.Dialog.run(self, *args, **kwargs)
++
+     action_area = property(lambda dialog: dialog.get_action_area())
+     vbox = property(lambda dialog: dialog.get_content_area())
+ 
+@@ -1559,6 +1564,15 @@
+ def main_quit(*args):
+     _Gtk_main_quit()
+ 
++_Gtk_main = Gtk.main
++
++
++@override(Gtk.main)
++def main(*args, **kwargs):
++    with wakeup_on_signal():
++        return _Gtk_main(*args, **kwargs)
++
++
+ stock_lookup = strip_boolean_result(Gtk.stock_lookup)
+ __all__.append('stock_lookup')
+ 
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -126,6 +126,7 @@
+ 	test_docstring.py \
+ 	test_repository.py \
+ 	test_resulttuple.py \
++	test_ossig.py \
+ 	compat_test_pygtk.py \
+ 	gi/__init__.py \
+ 	gi/overrides/__init__.py \
+--- /dev/null
++++ b/tests/test_ossig.py
+@@ -0,0 +1,102 @@
++# -*- coding: utf-8 -*-
++# Copyright 2017 Christoph Reiter
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2.1 of the License, or (at your option) any later version.
++#
++# This library is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++# Lesser General Public License for more details.
++#
++# You should have received a copy of the GNU Lesser General Public
++# License along with this library; if not, see <http://www.gnu.org/licenses/>.
++
++import os
++import signal
++import unittest
++import threading
++from contextlib import contextmanager
++
++from gi.repository import Gtk, Gio, GLib
++from gi._ossighelper import wakeup_on_signal
++
++
++class TestOverridesWakeupOnAlarm(unittest.TestCase):
++
++    @contextmanager
++    def _run_with_timeout(self, timeout, abort_func):
++        failed = []
++
++        def fail():
++            abort_func()
++            failed.append(1)
++            return True
++
++        fail_id = GLib.timeout_add(timeout, fail)
++        try:
++            yield
++        finally:
++            GLib.source_remove(fail_id)
++        self.assertFalse(failed)
++
++    def test_basic(self):
++        self.assertEqual(signal.set_wakeup_fd(-1), -1)
++        with wakeup_on_signal():
++            pass
++        self.assertEqual(signal.set_wakeup_fd(-1), -1)
++
++    def test_in_thread(self):
++        failed = []
++
++        def target():
++            try:
++                with wakeup_on_signal():
++                    pass
++            except:
++                failed.append(1)
++
++        t = threading.Thread(target=target)
++        t.start()
++        t.join(5)
++        self.assertFalse(failed)
++
++    @unittest.skipIf(os.name == "nt", "not on Windows")
++    def test_glib_mainloop(self):
++        loop = GLib.MainLoop()
++        signal.signal(signal.SIGALRM, lambda *args: loop.quit())
++        GLib.idle_add(signal.setitimer, signal.ITIMER_REAL, 0.001)
++
++        with self._run_with_timeout(2000, loop.quit):
++            loop.run()
++
++    @unittest.skipIf(os.name == "nt", "not on Windows")
++    def test_gio_application(self):
++        app = Gio.Application()
++        signal.signal(signal.SIGALRM, lambda *args: app.quit())
++        GLib.idle_add(signal.setitimer, signal.ITIMER_REAL, 0.001)
++
++        with self._run_with_timeout(2000, app.quit):
++            app.hold()
++            app.connect("activate", lambda *args: None)
++            app.run()
++
++    @unittest.skipIf(os.name == "nt", "not on Windows")
++    def test_gtk_main(self):
++        signal.signal(signal.SIGALRM, lambda *args: Gtk.main_quit())
++        GLib.idle_add(signal.setitimer, signal.ITIMER_REAL, 0.001)
++
++        with self._run_with_timeout(2000, Gtk.main_quit):
++            Gtk.main()
++
++    @unittest.skipIf(os.name == "nt", "not on Windows")
++    def test_gtk_dialog_run(self):
++        w = Gtk.Window()
++        d = Gtk.Dialog(transient_for=w)
++        signal.signal(signal.SIGALRM, lambda *args: d.destroy())
++        GLib.idle_add(signal.setitimer, signal.ITIMER_REAL, 0.001)
++
++        with self._run_with_timeout(2000, d.destroy):
++            d.run()
