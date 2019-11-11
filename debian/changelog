@@ -1,3 +1,9 @@
+pygobject (3.22.0-2danos1) unstable; urgency=medium
+
+  * Restore signal handling with GMainLoop usage
+
+ -- Daniel Gollub <dgollub@att.com>  Mon, 11 Nov 2019 09:02:27 +0100
+
 pygobject (3.22.0-2) unstable; urgency=medium
 
   * Temporarily disable pep8 during the build. Closes: #844924.
